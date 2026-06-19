@@ -1,6 +1,7 @@
 @echo off
 setlocal
 cd /d "%~dp0"
+set PYTHONUTF8=1
 
 where python >nul 2>nul
 if errorlevel 1 (
@@ -10,12 +11,19 @@ if errorlevel 1 (
   exit /b 1
 )
 
-python -m pip install -r requirements.txt
-if errorlevel 1 (
-  echo Dependency installation failed.
-  pause
-  exit /b 1
+if /i "%~1"=="--install" (
+  python -m pip install -r requirements.txt
+  if errorlevel 1 (
+    echo Dependency installation failed.
+    pause
+    exit /b 1
+  )
 )
 
 python main.py
+if errorlevel 1 (
+  echo Application exited with an error.
+  echo If dependencies are missing, run: run.bat --install
+  pause
+)
 endlocal

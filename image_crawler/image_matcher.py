@@ -3,6 +3,7 @@
 import math
 import os
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 
@@ -30,16 +31,49 @@ HEADERS = {
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
 }
 
+PREVIEW_THUMBNAIL_CACHE_SIZE = (320, 320)
 
-try:
-    import cv2  # type: ignore
-except Exception:  # OpenCV is optional; Pillow validation still works.
-    cv2 = None
+_SESSION_LOCAL = threading.local()
 
-try:
-    import numpy as np  # type: ignore
-except Exception:
-    np = None
+
+def _request_session():
+    session = getattr(_SESSION_LOCAL, "session", None)
+    if session is None:
+        session = requests.Session()
+        _SESSION_LOCAL.session = session
+    return session
+
+
+cv2 = None
+np = None
+_OPTIONAL_CV_LOADED = False
+_OPTIONAL_CV_LOCK = threading.Lock()
+
+
+def _load_optional_cv():
+    """Load OpenCV/Numpy only when visual features actually need them."""
+    global cv2, np, _OPTIONAL_CV_LOADED
+    if _OPTIONAL_CV_LOADED:
+        return cv2, np
+
+    with _OPTIONAL_CV_LOCK:
+        if _OPTIONAL_CV_LOADED:
+            return cv2, np
+
+        try:
+            import cv2 as cv2_mod  # type: ignore
+        except Exception:
+            cv2_mod = None
+
+        try:
+            import numpy as np_mod  # type: ignore
+        except Exception:
+            np_mod = None
+
+        cv2 = cv2_mod
+        np = np_mod
+        _OPTIONAL_CV_LOADED = True
+        return cv2, np
 
 
 COLOR_TERMS = {
@@ -191,22 +225,28 @@ def _request_headers(item):
 def fetch_image_bytes(item):
     headers = _request_headers(item)
     source = str(item.get("source", "")).lower()
+    urls = []
+    preview_url = item.get("_preview_url")
+    if preview_url:
+        urls.append(preview_url)
     if source in ("bing", "wallpaperscraft"):
-        urls = [item.get("url"), item.get("thumb")]
+        urls.extend([item.get("url"), item.get("thumb")])
     else:
-        urls = [item.get("thumb"), item.get("url")]
+        urls.extend([item.get("thumb"), item.get("url")])
     alt_urls = item.get("alt_urls") or []
     if isinstance(alt_urls, (list, tuple)):
         urls.extend(alt_urls)
     seen = set()
+    session = _request_session()
     for url in urls:
         if not url or url in seen:
             continue
         seen.add(url)
+        resp = None
         try:
             proxy = _wallhaven_proxy(item, url)
             if proxy:
-                resp = requests.get(
+                resp = session.get(
                     url,
                     headers=headers,
                     timeout=REQUEST_TIMEOUT,
@@ -214,7 +254,7 @@ def fetch_image_bytes(item):
                     proxies=proxy,
                 )
             else:
-                resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT, stream=True)
+                resp = session.get(url, headers=headers, timeout=REQUEST_TIMEOUT, stream=True)
             resp.raise_for_status()
             content_type = resp.headers.get("Content-Type", "").lower()
             if content_type and "text/html" in content_type:
@@ -225,6 +265,9 @@ def fetch_image_bytes(item):
             return data, resp.url, content_type
         except Exception:
             continue
+        finally:
+            if resp is not None:
+                resp.close()
     return b"", "", ""
 
 
@@ -251,6 +294,17 @@ def open_image(data):
         return img
     except Exception:
         return None
+
+
+def cache_preview_thumbnail(item, img):
+    try:
+        thumb = img.copy()
+        if thumb.mode not in ("RGB", "RGBA"):
+            thumb = thumb.convert("RGB")
+        thumb.thumbnail(PREVIEW_THUMBNAIL_CACHE_SIZE, Image.LANCZOS)
+        item["_thumb_pil"] = thumb.copy()
+    except Exception:
+        pass
 
 
 def image_quality_score(img):
@@ -341,15 +395,16 @@ def _needs_face(keyword):
 def face_match_score(img, keyword):
     if not _needs_face(keyword):
         return 0.0, ""
-    if cv2 is None or np is None:
+    cv2_mod, np_mod = _load_optional_cv()
+    if cv2_mod is None or np_mod is None:
         return 0.0, "opencv not installed"
 
     try:
         rgb = img.convert("RGB")
-        arr = np.array(rgb)
-        gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
-        cascade_path = os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
-        detector = cv2.CascadeClassifier(cascade_path)
+        arr = np_mod.array(rgb)
+        gray = cv2_mod.cvtColor(arr, cv2_mod.COLOR_RGB2GRAY)
+        cascade_path = os.path.join(cv2_mod.data.haarcascades, "haarcascade_frontalface_default.xml")
+        detector = cv2_mod.CascadeClassifier(cascade_path)
         faces = detector.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(32, 32))
         if len(faces) > 0:
             return min(1.4, 0.7 + len(faces) * 0.2), f"faces:{len(faces)}"
@@ -361,22 +416,23 @@ def face_match_score(img, keyword):
 def reference_match_score(img, reference_path):
     if not reference_path:
         return 0.0, ""
-    if cv2 is None or np is None:
+    cv2_mod, np_mod = _load_optional_cv()
+    if cv2_mod is None or np_mod is None:
         return 0.0, "opencv not installed"
 
     try:
-        target = cv2.cvtColor(np.array(img.convert("RGB")), cv2.COLOR_RGB2GRAY)
-        ref = cv2.imread(reference_path, cv2.IMREAD_GRAYSCALE)
+        target = cv2_mod.cvtColor(np_mod.array(img.convert("RGB")), cv2_mod.COLOR_RGB2GRAY)
+        ref = cv2_mod.imread(reference_path, cv2_mod.IMREAD_GRAYSCALE)
         if ref is None:
             return 0.0, "reference unreadable"
 
-        orb = cv2.ORB_create(nfeatures=1200)
+        orb = cv2_mod.ORB_create(nfeatures=1200)
         kp1, des1 = orb.detectAndCompute(ref, None)
         kp2, des2 = orb.detectAndCompute(target, None)
         if des1 is None or des2 is None or not kp1 or not kp2:
             return 0.0, "no features"
 
-        matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        matcher = cv2_mod.BFMatcher(cv2_mod.NORM_HAMMING, crossCheck=True)
         matches = matcher.match(des1, des2)
         if not matches:
             return 0.0, "matches:0"
@@ -408,6 +464,8 @@ def score_item(item, keyword, visual_enabled=VISUAL_MATCH_ENABLED, reference_pat
     item["_valid_image"] = q_score >= 0
     item["_size"] = img.size
     item["_content_type"] = content_type
+    if item["_valid_image"]:
+        cache_preview_thumbnail(item, img)
 
     if visual_enabled:
         c_score, c_reason = color_match_score(img, keyword)
@@ -470,4 +528,5 @@ def rank_items(items, keyword, limit=None, visual_enabled=VISUAL_MATCH_ENABLED, 
 
 
 def opencv_status():
-    return cv2 is not None and np is not None
+    cv2_mod, np_mod = _load_optional_cv()
+    return cv2_mod is not None and np_mod is not None
